@@ -8,75 +8,90 @@
 //
 // ESP32-CAM -> Pico:
 //   AA 55 + size_lo + size_hi + RAW 9216 + 55 AA
+//
+// [전체 흐름 한눈에]
+//   평상시 TRACKING 상태로 "P,x,y" 좌표를 받아 팬/틸트 서보로 손 추적.
+//   AA 55 마커를 만나면 RECEIVING_RAW로 전환 → 9216바이트 grayscale 수신
+//   → Edge Impulse 추론 → 제스처별 센서 액션(OLED/LED) → SHOWING_RESULT로
+//   결과를 일정 시간 유지한 뒤 다시 TRACKING으로 복귀.
 // ============================================================
 
-#include <gesture_recognition_inferencing.h>
-#include <Wire.h>
-#include <Servo.h>
-#include <Adafruit_BME280.h>
-#include <BH1750.h>
-#include <ScioSense_ENS16x.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_NeoPixel.h>
+// --- [STEP 0] 라이브러리 임포트 ---
+#include <gesture_recognition_inferencing.h>  // Edge Impulse 추론 라이브러리
+#include <Wire.h>                              // I2C (센서/OLED 공통 버스)
+#include <Servo.h>                             // 팬/틸트 서보 제어
+#include <Adafruit_BME280.h>                   // 온습도(인덱스 제스처)
+#include <BH1750.h>                            // 조도(빅토리 제스처)
+#include <ScioSense_ENS16x.h>                  // 공기질(주먹 제스처)
+#include <Adafruit_GFX.h>                      // OLED 그래픽 기반
+#include <Adafruit_SSD1306.h>                  // OLED 디스플레이
+#include <Adafruit_NeoPixel.h>                 // WS2812B LED
 
-#define PAN_PIN       0
-#define TILT_PIN      11
-#define LED_PIN       6
-#define LED_COUNT     5
+// --- [STEP 1] 핀 / 통신 / 카메라 해상도 정의 ---
+#define PAN_PIN       0    // 팬 서보 핀
+#define TILT_PIN      11   // 틸트 서보 핀
+#define LED_PIN       6    // WS2812B 데이터 핀
+#define LED_COUNT     5    // LED 개수
 
-#define UART_RX_PIN   9
-#define UART_TX_PIN   8
+#define UART_RX_PIN   9    // ESP32-CAM로부터 수신(RX)
+#define UART_TX_PIN   8    // ESP32-CAM로 송신(TX)
 #define UART_BAUD     115200
 
-#define CAM_UART Serial2
+#define CAM_UART Serial2   // ESP32-CAM 통신용 하드웨어 UART
 
-#define CAM_W 320
-#define CAM_H 240
+#define CAM_W 320          // 좌표 정규화 기준이 되는 카메라 가로 해상도
+#define CAM_H 240          // 〃 세로 해상도
 
-#define PAN_CENTER     90
-#define PAN_RANGE      40
-#define TILT_CENTER    90
-#define TILT_RANGE     25
+// --- [STEP 2] 팬/틸트 추적 동작 파라미터 ---
+#define PAN_CENTER     90  // 팬 중앙 각도
+#define PAN_RANGE      40  // 팬 가동 범위(±)
+#define TILT_CENTER    90  // 틸트 중앙 각도
+#define TILT_RANGE     25  // 틸트 가동 범위(±)
 
-#define SMOOTH_PAN     0.15f
-#define SMOOTH_TILT    0.08f
+#define SMOOTH_PAN     0.15f  // 팬 평활화 계수(작을수록 부드럽고 느림)
+#define SMOOTH_TILT    0.08f  // 틸트 평활화 계수
 
-#define DEADZONE_X     25
-#define DEADZONE_Y     50
+#define DEADZONE_X     25  // 중앙 부근 x 오차 무시 범위(미세 떨림 방지)
+#define DEADZONE_Y     50  // 〃 y
 
-#define ANGLE_TH_PAN   0.8f
-#define ANGLE_TH_TILT  1.5f
+#define ANGLE_TH_PAN   0.8f  // 이 각도 이상 변할 때만 팬 서보 갱신
+#define ANGLE_TH_TILT  1.5f  // 〃 틸트(서보 지터/소음 감소)
 
-#define CONFIDENCE_THRESHOLD  0.5f
-#define RESULT_DISPLAY_MS     5000
+// --- [STEP 3] 추론 판정 / 결과 표시 시간 ---
+#define CONFIDENCE_THRESHOLD  0.5f   // 이 점수 미만이면 "다시 시도"
+#define RESULT_DISPLAY_MS     5000   // 추론 결과 유지 시간(ms)
 
-#define RAW_MARKER_1   0xAA
-#define RAW_MARKER_2   0x55
+// --- [STEP 4] RAW 프레임 마커 및 입력 규격 ---
+#define RAW_MARKER_1   0xAA  // 시작 마커 1 / 종료 마커 2
+#define RAW_MARKER_2   0x55  // 시작 마커 2 / 종료 마커 1
 
 #define RAW_W 96
 #define RAW_H 96
-#define RAW_SIZE 9216
+#define RAW_SIZE 9216  // 96x96 grayscale 1바이트/픽셀
 
+// --- [STEP 5] 상태 머신 정의 ---
+// 전체 동작은 3개 상태로 구성된다.
 enum State {
-  STATE_TRACKING,
-  STATE_RECEIVING_RAW,
-  STATE_SHOWING_RESULT
+  STATE_TRACKING,        // 좌표 수신 + 서보 추적
+  STATE_RECEIVING_RAW,   // RAW 9216바이트 수신 중
+  STATE_SHOWING_RESULT   // 추론 결과 화면 유지 중
 };
 
+// RAW 수신 단계를 세분화한 하위 상태 머신
 enum RawRecvState {
-  RR_WAIT_SIZE_LO,
-  RR_WAIT_SIZE_HI,
-  RR_WAIT_DATA,
-  RR_WAIT_END_1,
-  RR_WAIT_END_2
+  RR_WAIT_SIZE_LO,  // 크기 하위바이트 대기
+  RR_WAIT_SIZE_HI,  // 크기 상위바이트 대기
+  RR_WAIT_DATA,     // 9216바이트 본문 수신
+  RR_WAIT_END_1,    // 종료 마커 1(0x55) 대기
+  RR_WAIT_END_2     // 종료 마커 2(0xAA) 대기
 };
 
 State currentState = STATE_TRACKING;
 RawRecvState rawState = RR_WAIT_SIZE_LO;
 
-unsigned long stateEnteredAt = 0;
+unsigned long stateEnteredAt = 0;  // 상태 진입 시각(타임아웃/표시시간 기준)
 
+// --- [STEP 6] 액추에이터 / 센서 객체 ---
 Servo panServo;
 Servo tiltServo;
 
@@ -86,36 +101,42 @@ ENS160 ens160;
 Adafruit_SSD1306 oled(128, 64, &Wire);
 Adafruit_NeoPixel leds(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-float current_pan = PAN_CENTER;
-float current_tilt = TILT_CENTER;
-float last_set_pan = PAN_CENTER;
-float last_set_tilt = TILT_CENTER;
+// --- [STEP 7] 서보 추적 상태 변수 ---
+float current_pan = PAN_CENTER;   // 평활화 후 현재 팬 각도
+float current_tilt = TILT_CENTER; // 평활화 후 현재 틸트 각도
+float last_set_pan = PAN_CENTER;  // 마지막으로 실제 write한 팬 각도
+float last_set_tilt = TILT_CENTER;// 〃 틸트
 
-String uart_line_buffer = "";
+String uart_line_buffer = "";  // "P,x,y" 텍스트 라인 누적 버퍼
 
-uint8_t raw_buffer[RAW_SIZE];
-uint8_t decoded_gray[RAW_SIZE];
+// --- [STEP 8] RAW 수신 버퍼 및 진행 상태 ---
+uint8_t raw_buffer[RAW_SIZE];    // UART로 받은 원본 누적
+uint8_t decoded_gray[RAW_SIZE];  // 추론에 실제 사용할 최종 grayscale
 
-size_t raw_expected_size = 0;
-size_t raw_received = 0;
+size_t raw_expected_size = 0;  // 헤더에서 읽은 예상 크기
+size_t raw_received = 0;       // 현재까지 받은 바이트 수
 
+// --- [STEP 9] 추론 결과 캐시 ---
 int last_predicted_class = -1;
 float last_confidence = 0.0f;
 
+// --- [STEP 10] 센서 가용 여부 플래그(초기화 성공 시 true) ---
 bool bme_available = false;
 bool bh_available = false;
 bool ens_available = false;
 bool oled_available = false;
 
-uint32_t COLOR_FIST      = 0x0000FF;
-uint32_t COLOR_OFF       = 0x000000;
+// --- [STEP 11] 제스처별 LED 색상 정의 ---
+uint32_t COLOR_FIST      = 0x0000FF;  // 주먹: 파랑
+uint32_t COLOR_OFF       = 0x000000;  // 꺼짐
 uint32_t COLOR_INDEX     = 0x00FF00;
 uint32_t COLOR_VICTORY   = 0xFFFF00;
 uint32_t COLOR_OK        = 0xFFFFFF;
 uint32_t COLOR_IDLE      = 0x002200;
 uint32_t COLOR_UNCERTAIN = 0xFF0000;
-uint32_t COLOR_RECEIVING = 0xFFAA00;
+uint32_t COLOR_RECEIVING = 0xFFAA00;  // RAW 수신 중: 주황
 
+// 주의: class_names 순서는 Edge Impulse 라벨 인덱스와 일치해야 한다.
 const char* class_names[4] = {
   "fist",
   "index",
@@ -123,6 +144,7 @@ const char* class_names[4] = {
   "victory"
 };
 
+// --- [STEP 12] LED 전체를 같은 색으로 설정 ---
 void setAllLeds(uint32_t color) {
   for (int i = 0; i < LED_COUNT; i++) {
     leds.setPixelColor(i, color);
@@ -131,15 +153,18 @@ void setAllLeds(uint32_t color) {
 }
 
 // ============================================================
-// Edge Impulse 이미지 입력
+// [STEP 13] Edge Impulse 이미지 입력 콜백
 // 매우 중요:
 // 0~1 정규화가 아니라 grayscale 값을 RGB888 packed로 전달.
 // v -> 0xRRGGBB = v,v,v
+//   (학습 시 Edge Impulse가 grayscale을 RGB로 펼쳐 쓰므로,
+//    추론 입력도 동일하게 v를 R/G/B 세 채널에 똑같이 채워야 함)
 // ============================================================
 int get_signal_data(size_t offset, size_t length, float* out_ptr) {
   for (size_t i = 0; i < length; i++) {
     uint8_t v = decoded_gray[offset + i];
 
+    // 동일 grayscale 값을 R,G,B 8비트씩 채워 24비트 정수로 패킹
     uint32_t rgb =
       ((uint32_t)v << 16) |
       ((uint32_t)v << 8)  |
@@ -151,30 +176,34 @@ int get_signal_data(size_t offset, size_t length, float* out_ptr) {
   return 0;
 }
 
+// --- [STEP 14] 서보 각도 안전 범위로 제한 후 write ---
 void setServoAngle(Servo& s, float angle) {
-  if (angle < 10) angle = 10;
+  if (angle < 10) angle = 10;     // 기구 한계 보호
   if (angle > 170) angle = 170;
   s.write((int)angle);
 }
 
-void showUncertain();
+void showUncertain();  // 전방 선언
 
 
+// --- [STEP 15] OLED 상단 제목 + 구분선 그리기 ---
 void drawTitle(const char* title, int x) {
   oled.setTextSize(2);
   oled.setCursor(x, 0);
   oled.println(title);
-  oled.drawLine(0, 19, 127, 19, SSD1306_WHITE);
+  oled.drawLine(0, 19, 127, 19, SSD1306_WHITE);  // 제목 아래 가로선
   oled.setTextSize(1);
-  oled.setCursor(0, 25);
+  oled.setCursor(0, 25);  // 본문 시작 위치
 }
 
+// --- [STEP 16] 제스처별 액션: 주먹 = 공기질(ENS160) ---
 void action_fist() {
   if (oled_available) {
     oled.clearDisplay();
     drawTitle("FIST", 38);
 
     if (ens_available) {
+      // 새 데이터가 준비됐을 때만 AQI/CO2/TVOC 표시
       if (ens160.update() == RESULT_OK && ens160.hasNewData()) {
         oled.print("AQI : ");
         oled.println((int)ens160.getAirQualityIndex_UBA());
@@ -187,6 +216,7 @@ void action_fist() {
         oled.print(ens160.getTvoc());
         oled.println(" ppb");
       } else {
+        // ENS160은 예열(warm-up) 필요
         oled.println("ENS160 warming...");
         oled.println("Please wait");
       }
@@ -201,13 +231,14 @@ void action_fist() {
   setAllLeds(COLOR_FIST);
 }
 
+// --- [STEP 17] 제스처별 액션: 검지 = 온습도(BME280) ---
 void action_index() {
   if (oled_available) {
     oled.clearDisplay();
     drawTitle("INDEX", 30);
 
     if (bme_available) {
-      bme.takeForcedMeasurement();
+      bme.takeForcedMeasurement();  // FORCED 모드라 측정 트리거 필요
 
       float temp = bme.readTemperature();
       float hum  = bme.readHumidity();
@@ -230,6 +261,7 @@ void action_index() {
   setAllLeds(COLOR_OFF);
 }
 
+// --- [STEP 18] 제스처별 액션: 빅토리 = 조도(BH1750) ---
 void action_victory() {
   if (oled_available) {
     oled.clearDisplay();
@@ -252,6 +284,7 @@ void action_victory() {
   setAllLeds(COLOR_OFF);
 }
 
+// --- [STEP 19] 제스처별 액션: OK = 확인 메시지 + 신뢰도 ---
 void action_ok() {
   if (oled_available) {
     oled.clearDisplay();
@@ -269,6 +302,9 @@ void action_ok() {
   setAllLeds(COLOR_OFF);
 }
 
+// --- [STEP 20] 클래스 인덱스 → 액션 함수 매핑 테이블 ---
+// 주의: 이 순서는 Edge Impulse 라벨 인덱스 순서와 일치해야 한다.
+//       (fist=0, index=1, ok=2, victory=3)
 typedef void (*ActionFn)();
 
 ActionFn action_table[4] = {
@@ -278,6 +314,7 @@ ActionFn action_table[4] = {
   action_victory
 };
 
+// --- [STEP 21] 신뢰도 미달/실패 시 "TRY AGAIN" 표시 ---
 void showUncertain() {
   if (oled_available) {
     oled.clearDisplay();
@@ -290,7 +327,7 @@ void showUncertain() {
 
     oled.setTextSize(1);
     oled.setCursor(80, 54);
-    oled.print(last_confidence, 2);
+    oled.print(last_confidence, 2);  // 참고용 점수
 
     oled.display();
   }
@@ -298,6 +335,8 @@ void showUncertain() {
   setAllLeds(COLOR_OFF);
 }
 
+// --- [STEP 22] 라벨/입력 규격 점검 출력(부팅 시 1회) ---
+// 학습-추론 불일치 디버깅용: 라벨 순서, 입력 W/H, 센서 타입 확인
 void printLabelCheck() {
   Serial.println("=== LABEL CHECK ===");
 
@@ -320,11 +359,14 @@ void printLabelCheck() {
   Serial.println(EI_CLASSIFIER_SENSOR);
 }
 
+// --- [STEP 23] Edge Impulse 추론 실행 + 결과 처리 ---
 void runInference() {
+  // (1) signal 구조체 구성 — 데이터는 get_signal_data 콜백으로 공급
   signal_t signal;
   signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
   signal.get_data = &get_signal_data;
 
+  // (2) 분류기 실행
   ei_impulse_result_t result;
   EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
 
@@ -334,6 +376,7 @@ void runInference() {
     return;
   }
 
+  // (3) 가장 점수 높은 클래스 탐색 + 전체 점수 로그
   float best_score = 0.0f;
   int best_class = -1;
 
@@ -352,15 +395,18 @@ void runInference() {
 
   Serial.println();
 
+  // (4) 결과 캐시
   last_predicted_class = best_class;
   last_confidence = best_score;
 
+  // (5) 신뢰도 미달이면 "다시 시도"
   if (best_score < CONFIDENCE_THRESHOLD || best_class < 0) {
     Serial.printf("[INFER] low confidence: %.4f\n", best_score);
     showUncertain();
     return;
   }
 
+  // (6) 통과하면 해당 클래스 액션 실행
   Serial.printf("[RESULT] predicted=%s score=%.4f\n",
                 result.classification[best_class].label,
                 best_score);
@@ -370,20 +416,21 @@ void runInference() {
 
 
 // ============================================================
-// Pico가 실제 추론에 사용한 decoded_gray 이미지를 USB Serial로 PC에 전송
+// [STEP 24] Pico가 실제 추론에 사용한 decoded_gray 이미지를 USB Serial로 PC에 전송
 // PC는 이 데이터를 pico_received.png로 저장합니다.
 //
 // Binary protocol:
 //   PRAW + size_lo + size_hi + 9216 bytes + DONE
+//   → PC측 PNG와 비교하면 "Pico가 본 이미지"를 그대로 확인 가능
 // ============================================================
 void sendPicoReceivedImageToPC() {
   const uint8_t header[4] = { 'P', 'R', 'A', 'W' };
   const uint8_t footer[4] = { 'D', 'O', 'N', 'E' };
 
   Serial.write(header, 4);
-  Serial.write((uint8_t)(RAW_SIZE & 0xFF));
-  Serial.write((uint8_t)((RAW_SIZE >> 8) & 0xFF));
-  Serial.write(decoded_gray, RAW_SIZE);
+  Serial.write((uint8_t)(RAW_SIZE & 0xFF));         // 크기 하위바이트
+  Serial.write((uint8_t)((RAW_SIZE >> 8) & 0xFF));  // 크기 상위바이트
+  Serial.write(decoded_gray, RAW_SIZE);             // 본문 9216바이트
   Serial.write(footer, 4);
   Serial.flush();
 
@@ -391,22 +438,26 @@ void sendPicoReceivedImageToPC() {
   Serial.println("[USB] pico_received image sent to PC");
 }
 
+// --- [STEP 25] 수신 완료된 RAW를 검증 → 통계 → 추론 ---
 void decodeAndInfer() {
   Serial.printf("[RAW] received=%d expected=%d\n",
                 raw_received,
                 raw_expected_size);
 
+  // (1) 크기 검증 — 둘 다 9216이어야 함
   if (raw_expected_size != RAW_SIZE || raw_received != RAW_SIZE) {
     Serial.println("[RAW] invalid size");
     showUncertain();
     return;
   }
 
+  // (2) 추론 입력 버퍼로 복사
   memcpy(decoded_gray, raw_buffer, RAW_SIZE);
 
   // PC에서 실제 Pico 추론 입력 이미지를 확인할 수 있도록 USB로 전송
   sendPicoReceivedImageToPC();
 
+  // (3) 품질 지표(min/max/avg/checksum) 계산 → PC 송신값과 대조
   uint8_t minv = 255;
   uint8_t maxv = 0;
   uint32_t checksum = 0;
@@ -423,14 +474,17 @@ void decodeAndInfer() {
 
   Serial.println("[INPUT] mode=RGB888 packed grayscale");
 
+  // (4) 추론 실행
   runInference();
 }
 
+// --- [STEP 26] "P,x,y" 좌표 라인 파싱 → 팬/틸트 추적 제어 ---
 void handleCoordLine(String line) {
   line.trim();
 
-  if (!line.startsWith("P,")) return;
+  if (!line.startsWith("P,")) return;  // 좌표 라인만 처리
 
+  // 쉼표 위치로 x,y 분리
   int c1 = line.indexOf(',');
   int c2 = line.indexOf(',', c1 + 1);
 
@@ -439,24 +493,30 @@ void handleCoordLine(String line) {
   int x = line.substring(c1 + 1, c2).toInt();
   int y = line.substring(c2 + 1).toInt();
 
+  // (1) 화면 중앙 대비 오차 계산
   int err_x = x - CAM_W / 2;
   int err_y = y - CAM_H / 2;
 
+  // (2) 데드존: 중앙 부근 미세 오차는 무시(떨림 방지)
   if (abs(err_x) < DEADZONE_X) err_x = 0;
   if (abs(err_y) < DEADZONE_Y) err_y = 0;
 
+  // (3) 오차를 목표 각도로 변환
+  //     팬은 좌우 반전(중앙에서 빼기), 틸트는 더하기
   float target_pan =
     PAN_CENTER - (err_x * (float)PAN_RANGE / (CAM_W / 2));
 
   float target_tilt =
     TILT_CENTER + (err_y * (float)TILT_RANGE / (CAM_H / 2));
 
+  // (4) 지수 평활(EMA)로 부드럽게 접근
   current_pan =
     current_pan * (1 - SMOOTH_PAN) + target_pan * SMOOTH_PAN;
 
   current_tilt =
     current_tilt * (1 - SMOOTH_TILT) + target_tilt * SMOOTH_TILT;
 
+  // (5) 변화량이 임계값 이상일 때만 실제 write(지터/소음 감소)
   if (fabs(current_pan - last_set_pan) > ANGLE_TH_PAN) {
     setServoAngle(panServo, current_pan);
     last_set_pan = current_pan;
@@ -468,6 +528,7 @@ void handleCoordLine(String line) {
   }
 }
 
+// --- [STEP 27] RAW 수신기 상태 초기화 → TRACKING 복귀 ---
 void resetRawReceiver() {
   currentState = STATE_TRACKING;
   rawState = RR_WAIT_SIZE_LO;
@@ -476,15 +537,18 @@ void resetRawReceiver() {
   setAllLeds(COLOR_OFF);
 }
 
+// --- [STEP 28] TRACKING 상태 처리: 좌표 라인 수신 + 마커 감지 ---
 void handleTracking() {
   int processed = 0;
-  static int prev_byte = -1;
+  static int prev_byte = -1;  // 직전 바이트 기억(AA 55 연속 감지용)
 
+  // 한 루프에 최대 512바이트만 처리(블로킹 방지)
   while (CAM_UART.available() && processed < 512) {
     processed++;
 
     int b = CAM_UART.read();
 
+    // (1) AA 다음에 55가 오면 RAW 시작 마커 → 상태 전환
     if (prev_byte == RAW_MARKER_1 && b == RAW_MARKER_2) {
       Serial.println("[MARKER] AA 55 detected");
       Serial.println("[STATE] TRACKING -> RECEIVING_RAW");
@@ -498,20 +562,22 @@ void handleTracking() {
       uart_line_buffer = "";
       prev_byte = -1;
 
-      setAllLeds(COLOR_RECEIVING);
+      setAllLeds(COLOR_RECEIVING);  // 수신 중 주황 표시
       return;
     }
 
     prev_byte = b;
 
+    // (2) 개행이면 누적된 한 줄을 좌표로 파싱
     if (b == '\n') {
       handleCoordLine(uart_line_buffer);
       uart_line_buffer = "";
       continue;
     }
 
-    if (b == '\r') continue;
+    if (b == '\r') continue;  // CR 무시
 
+    // (3) 라인 누적: 시작 문자는 'P' 또는 'N'만 허용(잡음 필터)
     if (uart_line_buffer.length() == 0) {
       if (b == 'P' || b == 'N') {
         uart_line_buffer += (char)b;
@@ -519,6 +585,7 @@ void handleTracking() {
     } else {
       uart_line_buffer += (char)b;
 
+      // 비정상적으로 긴 라인은 폐기(동기 깨짐 복구)
       if (uart_line_buffer.length() > 64) {
         uart_line_buffer = "";
       }
@@ -526,7 +593,9 @@ void handleTracking() {
   }
 }
 
+// --- [STEP 29] RECEIVING_RAW 상태 처리: 9216바이트 + 종료마커 수신 ---
 void handleReceivingRaw() {
+  // (1) 5초 안에 다 못 받으면 타임아웃 → 초기화
   if (millis() - stateEnteredAt > 5000) {
     Serial.printf("[RAW] timeout: received=%d expected=%d\n",
                   raw_received,
@@ -537,22 +606,25 @@ void handleReceivingRaw() {
 
   int processed = 0;
 
+  // 한 루프에 최대 2048바이트 처리(수신 속도 확보)
   while (CAM_UART.available() && processed < 2048) {
     processed++;
 
     uint8_t b = CAM_UART.read();
 
+    // (2) 하위 상태 머신으로 단계별 수신
     switch (rawState) {
       case RR_WAIT_SIZE_LO:
-        raw_expected_size = b;
+        raw_expected_size = b;          // 크기 하위바이트
         rawState = RR_WAIT_SIZE_HI;
         break;
 
       case RR_WAIT_SIZE_HI:
-        raw_expected_size |= ((uint16_t)b << 8);
+        raw_expected_size |= ((uint16_t)b << 8);  // 상위바이트 결합
 
         Serial.printf("[RAW] expected size=%d\n", raw_expected_size);
 
+        // 크기가 9216이 아니면 즉시 폐기
         if (raw_expected_size != RAW_SIZE) {
           Serial.printf("[RAW] size error: %d\n", raw_expected_size);
           resetRawReceiver();
@@ -564,14 +636,15 @@ void handleReceivingRaw() {
         break;
 
       case RR_WAIT_DATA:
-        raw_buffer[raw_received++] = b;
+        raw_buffer[raw_received++] = b;  // 본문 누적
 
         if (raw_received >= RAW_SIZE) {
-          rawState = RR_WAIT_END_1;
+          rawState = RR_WAIT_END_1;       // 다 받으면 종료마커 대기
         }
         break;
 
       case RR_WAIT_END_1:
+        // 종료 마커 첫 바이트는 0x55여야 함
         if (b == RAW_MARKER_2) {
           rawState = RR_WAIT_END_2;
         } else {
@@ -582,11 +655,12 @@ void handleReceivingRaw() {
         break;
 
       case RR_WAIT_END_2:
+        // 종료 마커 둘째 바이트는 0xAA여야 함 → 완성
         if (b == RAW_MARKER_1) {
           Serial.println("[RAW] end marker OK");
-          decodeAndInfer();
+          decodeAndInfer();  // 검증 + 추론 실행
 
-          currentState = STATE_SHOWING_RESULT;
+          currentState = STATE_SHOWING_RESULT;  // 결과 표시 상태로
           stateEnteredAt = millis();
           return;
         } else {
@@ -599,14 +673,17 @@ void handleReceivingRaw() {
   }
 }
 
+// --- [STEP 30] SHOWING_RESULT 상태 처리: 결과 유지 + 잔여 입력 비움 ---
 void handleShowingResult() {
   int processed = 0;
 
+  // (1) 결과 표시 중 들어오는 UART는 버려서 버퍼가 차지 않게 함
   while (CAM_UART.available() && processed < 512) {
     CAM_UART.read();
     processed++;
   }
 
+  // (2) 표시 시간(5초) 경과 시 TRACKING으로 복귀
   if (millis() - stateEnteredAt >= RESULT_DISPLAY_MS) {
     Serial.println("[STATE] SHOWING_RESULT -> TRACKING (display kept)");
 
@@ -621,15 +698,19 @@ void handleShowingResult() {
   }
 }
 
+// ============================================================
+// [STEP 31] 초기 설정(부팅 시 1회)
+// ============================================================
 void setup() {
-  delay(2000);
+  delay(2000);  // 전원 안정화 대기
 
-  Serial.begin(115200);
+  Serial.begin(115200);  // USB 디버그 시리얼
   delay(500);
 
   Serial.println();
   Serial.println("=== Pico 2W RAW UART Receiver Final ===");
 
+  // (1) ESP32-CAM 통신용 UART(Serial2) 핀/속도 설정
   CAM_UART.setTX(UART_TX_PIN);
   CAM_UART.setRX(UART_RX_PIN);
   CAM_UART.begin(UART_BAUD);
@@ -637,13 +718,16 @@ void setup() {
   Serial.printf("[UART] Serial2 @ %d bps, TX=%d RX=%d\n",
                 UART_BAUD, UART_TX_PIN, UART_RX_PIN);
 
+  // (2) 라벨/입력 규격 점검 출력
   printLabelCheck();
 
+  // (3) I2C 버스 시작(SDA=4, SCL=5, 400kHz)
   Wire.setSDA(4);
   Wire.setSCL(5);
   Wire.begin();
   Wire.setClock(400000);
 
+  // (4) OLED 초기화 + 대기 화면
   oled_available = oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 
   if (oled_available) {
@@ -656,6 +740,7 @@ void setup() {
     oled.display();
   }
 
+  // (5) BME280 — 0x76 먼저, 실패 시 0x77 재시도
   bme_available = bme.begin(0x76);
 
   if (!bme_available) {
@@ -663,6 +748,7 @@ void setup() {
   }
 
   if (bme_available) {
+    // FORCED 모드 + 필터 OFF (요청 시에만 1회 측정)
     bme.setSampling(Adafruit_BME280::MODE_FORCED,
                     Adafruit_BME280::SAMPLING_X1,
                     Adafruit_BME280::SAMPLING_X1,
@@ -670,8 +756,10 @@ void setup() {
                     Adafruit_BME280::FILTER_OFF);
   }
 
+  // (6) BH1750 조도 센서
   bh_available = lightMeter.begin();
 
+  // (7) ENS160 공기질 — 최대 3초 동안 init 재시도
   ens160.begin(&Wire, 0x53);
 
   unsigned long ens_start = millis();
@@ -687,19 +775,22 @@ void setup() {
   }
 
   if (ens_available) {
-    ens160.startStandardMeasure();
+    ens160.startStandardMeasure();  // 표준 측정 모드 시작
   }
 
+  // (8) 서보 부착 후 중앙 정렬
   panServo.attach(PAN_PIN);
   tiltServo.attach(TILT_PIN);
 
   setServoAngle(panServo, PAN_CENTER);
   setServoAngle(tiltServo, TILT_CENTER);
 
+  // (9) LED 초기화(밝기 50, 전체 OFF)
   leds.begin();
   leds.setBrightness(50);
   setAllLeds(COLOR_OFF);
 
+  // (10) 초기 상태 = TRACKING
   currentState = STATE_TRACKING;
   rawState = RR_WAIT_SIZE_LO;
   stateEnteredAt = millis();
@@ -707,20 +798,23 @@ void setup() {
   Serial.println("=== Setup done. TRACKING ===");
 }
 
+// ============================================================
+// [STEP 32] 메인 루프 — 현재 상태에 맞는 핸들러만 호출
+// ============================================================
 void loop() {
   switch (currentState) {
     case STATE_TRACKING:
-      handleTracking();
+      handleTracking();        // 좌표 추적 + 마커 감지
       break;
 
     case STATE_RECEIVING_RAW:
-      handleReceivingRaw();
+      handleReceivingRaw();    // RAW 9216 수신 + 추론 트리거
       break;
 
     case STATE_SHOWING_RESULT:
-      handleShowingResult();
+      handleShowingResult();   // 결과 유지 + 복귀
       break;
   }
 
-  delay(1);
+  delay(1);  // 과도한 CPU 점유 방지
 }
